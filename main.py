@@ -4,12 +4,12 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Depends, Header, Query
+from fastapi import FastAPI, HTTPException, Depends, Header, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 
 from database import db, create_document, get_documents
-from schemas import Users, Characters, Courses, Modules, Attempts, Levels, Recommendations, StoryChapters, LoginSessions
+from schemas import Users, Characters, Courses, Modules, Attempts, Levels, Recommendations, StoryChapters, LoginSessions, Notifications
 
 app = FastAPI(title="Adaptive LMS RPG API")
 
@@ -436,6 +436,16 @@ def submit_attempt(payload: AttemptRequest):
     ).model_dump()
     db["recommendations"].insert_one(rec_doc)
 
+    # Notification: level up
+    if leveled_up:
+        note = Notifications(
+            title="Level Up!",
+            message=f"You reached level {next_level_num}.",
+            audience="students",
+            created_by=None,
+        ).model_dump()
+        db["notifications"].insert_one(note)
+
     return {
         "xp_gained": xp_gain,
         "new_xp": new_xp,
@@ -488,11 +498,18 @@ def analytics_student(user_id: str):
         mastery_topics.setdefault(topic, []).append(float(a.get("score", 0)))
     mastery_avg = {k: (sum(v) / len(v)) for k, v in mastery_topics.items()}
     badges = []  # MVP placeholder
+    # Completion percentage = completed attempts / total modules (simple approximation)
+    total_modules = db["modules"].count_documents({})
+    completed = len([a for a in attempts if a.get("completion_status") == "completed"]) if attempts else 0
+    completion_pct = round((completed / max(1, total_modules)) * 100.0, 1)
+    avg_score_overall = round(sum([float(a.get("score", 0)) for a in attempts]) / max(1, len(attempts)), 1)
     return {
         "user": {"name": user.get("name"), "level": user.get("current_level"), "xp": user.get("xp_points")},
         "mastery": mastery_avg,
         "badges": badges,
         "attempts_count": len(attempts),
+        "completion_pct": completion_pct,
+        "avg_score": avg_score_overall,
     }
 
 
@@ -502,7 +519,32 @@ def analytics_teacher_overview():
     for s in students:
         s["_id"] = str(s["_id"])
     total_attempts = db["attempts"].count_documents({})
-    return {"students": len(students), "attempts": total_attempts}
+    # Aggregate exam/quiz results (avg score for quiz type)
+    quiz_mod_ids = [str(m["_id"]) for m in db["modules"].find({"content_type": "quiz"})]
+    quiz_attempts = list(db["attempts"].find({"module": {"$in": quiz_mod_ids}}))
+    quiz_avg = round(sum([float(a.get("score", 0)) for a in quiz_attempts]) / max(1, len(quiz_attempts)), 1)
+    return {"students": len(students), "attempts": total_attempts, "quiz_average": quiz_avg}
+
+
+@app.get("/api/teacher/quiz_results")
+def teacher_quiz_results(limit: int = Query(50)):
+    # Return recent quiz attempts with user and module info
+    from bson import ObjectId
+    quiz_mods = list(db["modules"].find({"content_type": "quiz"}))
+    quiz_ids = [str(m["_id"]) for m in quiz_mods]
+    attempts = list(db["attempts"].find({"module": {"$in": quiz_ids}}).sort("timestamp", -1).limit(limit))
+    out = []
+    for a in attempts:
+        u = db["users"].find_one({"_id": ObjectId(a["user"])}) if a.get("user") else None
+        m = db["modules"].find_one({"_id": ObjectId(a["module"])}) if a.get("module") else None
+        out.append({
+            "user": u.get("name") if u else a.get("user"),
+            "module": m.get("title") if m else a.get("module"),
+            "score": a.get("score", 0),
+            "time_spent": a.get("time_spent", 0),
+            "timestamp": a.get("timestamp"),
+        })
+    return out
 
 
 @app.get("/api/analytics/admin/system")
@@ -544,6 +586,9 @@ def teacher_students():
     for s in students:
         uid = str(s["_id"])
         attempts_count = db["attempts"].count_documents({"user": uid})
+        # Average score for this student
+        att = list(db["attempts"].find({"user": uid}))
+        avg_score = round(sum([float(a.get("score", 0)) for a in att]) / max(1, len(att)), 1)
         data.append({
             "_id": uid,
             "name": s.get("name"),
@@ -551,8 +596,110 @@ def teacher_students():
             "level": s.get("current_level", 1),
             "xp": s.get("xp_points", 0),
             "attempts": attempts_count,
+            "avg_score": avg_score,
         })
     return data
+
+
+class NewContentRequest(BaseModel):
+    title: str
+    course_category: str
+    content_type: str = "text"  # video | text | quiz | game
+    difficulty_level: int = 1
+    xp_reward: int = 50
+    topic: Optional[str] = None
+
+
+@app.post("/api/teacher/new_content")
+def teacher_new_content(req: NewContentRequest):
+    # Find course by category
+    course = db["courses"].find_one({"category": req.course_category})
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+    mod = Modules(
+        title=req.title,
+        course=str(course["_id"]),
+        content_type=req.content_type,
+        difficulty_level=req.difficulty_level,
+        xp_reward=req.xp_reward,
+        topic=req.topic,
+    ).model_dump()
+    db["modules"].insert_one(mod)
+    # Create a notification for students
+    note = Notifications(
+        title="New content posted",
+        message=f"{req.course_category}: {req.title}",
+        audience="students",
+        created_by=None,
+    ).model_dump()
+    db["notifications"].insert_one(note)
+    return {"created": True}
+
+
+# ------------------------
+# Admin Module Management (CRUD)
+# ------------------------
+
+class ModuleUpsert(BaseModel):
+    title: str
+    course: str  # course id
+    content_type: str
+    difficulty_level: int
+    xp_reward: int = 50
+    topic: Optional[str] = None
+
+
+@app.get("/api/admin/modules")
+def admin_list_modules():
+    mods = list(db["modules"].find({}).sort("title", 1))
+    for m in mods:
+        m["_id"] = str(m["_id"])
+    return mods
+
+
+@app.post("/api/admin/modules")
+def admin_create_module(req: ModuleUpsert):
+    mod = Modules(**req.model_dump()).model_dump()
+    db["modules"].insert_one(mod)
+    return {"created": True}
+
+
+@app.put("/api/admin/modules/{module_id}")
+def admin_update_module(module_id: str, req: ModuleUpsert):
+    from bson import ObjectId
+    db["modules"].update_one({"_id": ObjectId(module_id)}, {"$set": req.model_dump()})
+    return {"updated": True}
+
+
+@app.delete("/api/admin/modules/{module_id}")
+def admin_delete_module(module_id: str):
+    from bson import ObjectId
+    db["modules"].delete_one({"_id": ObjectId(module_id)})
+    return {"deleted": True}
+
+
+# ------------------------
+# Notifications
+# ------------------------
+
+class NotificationReadRequest(BaseModel):
+    notification_id: str
+    user_id: str
+
+
+@app.get("/api/notifications")
+def list_notifications(audience: str = Query("students")):
+    notes = list(db["notifications"].find({"$or": [{"audience": audience}, {"audience": "all"}]}).sort("created_at", -1).limit(20))
+    for n in notes:
+        n["_id"] = str(n["_id"])
+    return notes
+
+
+@app.post("/api/notifications/read")
+def read_notification(req: NotificationReadRequest):
+    from bson import ObjectId
+    db["notifications"].update_one({"_id": ObjectId(req.notification_id)}, {"$addToSet": {"read_by": req.user_id}})
+    return {"ok": True}
 
 
 # ------------------------

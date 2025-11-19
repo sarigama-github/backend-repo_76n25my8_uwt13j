@@ -106,6 +106,15 @@ class LoginSessions(BaseModel):
     last_activity: datetime = Field(default_factory=datetime.utcnow)
     is_active: bool = True
 
+# 10) Notifications
+class Notifications(BaseModel):
+    title: str
+    message: str
+    audience: str = Field(default="students", description="students | teachers | admins | all")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_by: Optional[str] = None  # teacher/admin id
+    read_by: List[str] = Field(default_factory=list)  # user ids who read
+
 # Helper to expose schema for viewers
 class SchemaInfo(BaseModel):
     name: str

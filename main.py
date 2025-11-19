@@ -54,6 +54,7 @@ class LoginResponse(BaseModel):
     token: str
     role: str
     redirect: str
+    user_id: str
 
 
 class AttemptRequest(BaseModel):
@@ -253,7 +254,7 @@ def register(payload: RegisterRequest):
 
     redirect = "/student" if payload.role == "student" else ("/teacher" if payload.role == "teacher" else "/admin")
 
-    return LoginResponse(token=token, role=payload.role, redirect=redirect)
+    return LoginResponse(token=token, role=payload.role, redirect=redirect, user_id=str(res_id))
 
 
 @app.post("/api/login", response_model=LoginResponse)
@@ -273,7 +274,7 @@ def login(payload: LoginRequest):
 
     role = user.get("role", "student")
     redirect = "/student" if role == "student" else ("/teacher" if role == "teacher" else "/admin")
-    return LoginResponse(token=token, role=role, redirect=redirect)
+    return LoginResponse(token=token, role=role, redirect=redirect, user_id=str(user["_id"]))
 
 
 @app.post("/api/logout")
@@ -281,6 +282,16 @@ def logout(auth=Depends(auth_required)):
     token = auth["token"]
     db["loginsessions"].update_one({"session_token": token}, {"$set": {"is_active": False}})
     return {"success": True}
+
+
+@app.get("/api/me")
+def me(auth=Depends(auth_required)):
+    u = auth["user"]
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    u_copy = {k: (str(v) if k == "_id" else v) for k, v in u.items()}
+    u_copy["_id"] = str(u.get("_id"))
+    return u_copy
 
 
 # ------------------------
@@ -317,6 +328,14 @@ def list_story_chapters(user_id: Optional[str] = None, language_path: Optional[s
     return chapters
 
 
+@app.get("/api/levels")
+def list_levels():
+    levels = list(db["levels"].find({}).sort("level_number", 1))
+    for lv in levels:
+        lv["_id"] = str(lv["_id"])
+    return levels
+
+
 # ------------------------
 # Gameplay & Adaptive Logic
 # ------------------------
@@ -349,8 +368,6 @@ def suggested_format_from_scores(user_id: str) -> Optional[str]:
 @app.post("/api/attempts")
 def submit_attempt(payload: AttemptRequest):
     # Record attempt
-    mod = db["modules"].find_one({"_id": db["modules"].database.client.get_default_database().decode_named_subcollection_name(payload.module_id)}) if False else db["modules"].find_one({"_id": None})
-    # Flexible: module stored by string id, so direct find by _id string using $toObjectId
     from bson import ObjectId
     try:
         mod = db["modules"].find_one({"_id": ObjectId(payload.module_id)})
@@ -517,6 +534,92 @@ def grant_xp(req: GrantXPRequest):
     new_xp = int(user.get("xp_points", 0)) + int(req.xp)
     db["users"].update_one({"_id": user["_id"]}, {"$set": {"xp_points": new_xp}})
     return {"xp_points": new_xp}
+
+
+@app.get("/api/teacher/students")
+def teacher_students():
+    # Basic roster with progress stats
+    students = list(db["users"].find({"role": "student"}))
+    data = []
+    for s in students:
+        uid = str(s["_id"])
+        attempts_count = db["attempts"].count_documents({"user": uid})
+        data.append({
+            "_id": uid,
+            "name": s.get("name"),
+            "email": s.get("email"),
+            "level": s.get("current_level", 1),
+            "xp": s.get("xp_points", 0),
+            "attempts": attempts_count,
+        })
+    return data
+
+
+# ------------------------
+# Admin CSV import/export (lightweight)
+# ------------------------
+
+class CSVImportRequest(BaseModel):
+    type: str  # users | modules
+    csv: str
+
+
+@app.get("/api/admin/export")
+def admin_export(type: str = Query("users")):
+    import io, csv
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    if type == "users":
+        writer.writerow(["_id", "name", "email", "role", "level", "xp"])
+        for u in db["users"].find({}):
+            writer.writerow([str(u["_id"]), u.get("name"), u.get("email"), u.get("role"), u.get("current_level", 1), u.get("xp_points", 0)])
+    elif type == "modules":
+        writer.writerow(["_id", "title", "course", "type", "difficulty", "xp", "topic"]) 
+        for m in db["modules"].find({}):
+            writer.writerow([str(m["_id"]), m.get("title"), m.get("course"), m.get("content_type"), m.get("difficulty_level"), m.get("xp_reward"), m.get("topic")])
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported type")
+    return {"csv": buf.getvalue()}
+
+
+@app.post("/api/admin/import")
+def admin_import(req: CSVImportRequest):
+    import csv, io
+    created = 0
+    if req.type not in ("users", "modules"):
+        raise HTTPException(status_code=400, detail="Unsupported type")
+    reader = csv.DictReader(io.StringIO(req.csv))
+    if req.type == "users":
+        for row in reader:
+            if not row.get("email"):
+                continue
+            if db["users"].find_one({"email": row["email"]}):
+                continue
+            doc = Users(
+                name=row.get("name") or "Imported",
+                email=row["email"],
+                role=row.get("role") or "student",
+                hashed_password=hash_password("changeme"),
+                current_level=int(row.get("level") or 1),
+                xp_points=int(row.get("xp") or 0),
+            ).model_dump()
+            db["users"].insert_one(doc)
+            created += 1
+    else:  # modules
+        for row in reader:
+            if not row.get("title") or not row.get("course"):
+                continue
+            doc = Modules(
+                title=row["title"],
+                course=row["course"],
+                content_type=row.get("type") or "text",
+                difficulty_level=int(row.get("difficulty") or 1),
+                xp_reward=int(row.get("xp") or 50),
+                topic=row.get("topic") or None,
+            ).model_dump()
+            db["modules"].insert_one(doc)
+            created += 1
+    return {"created": created}
 
 
 # ------------------------
